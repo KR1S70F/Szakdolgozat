@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Valós Idejű FFT Spektrum</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        /* Kisebb stílus a diagram központosításához */
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 20px;
+        }
+        #fftChart {
+            max-width: 900px;
+            max-height: 500px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>ESP32 FFT Spektrum (Valós Időben)</h1>
+    <canvas id="fftChart" width="800" height="400"></canvas>
+    <p>Állapot: <span id="status">Kapcsolódás...</span></p>
+
+    <script>
+        const ESP32_IP = "172.20.10.6"; // IP címet le kell cserélni arra amit az Arduino kiír!!
+        const WEBSOCKET_PORT = 81; 
+        
+        const websocket = new WebSocket(`ws://${ESP32_IP}:${WEBSOCKET_PORT}/`);
+
+        let fftChart;
+        const SAMPLES = 1024;
+        const SAMPLING_FREQUENCY = 44100;
+        const FREQUENCY_RESOLUTION = SAMPLING_FREQUENCY / SAMPLES; // ~43.07 Hz
+
+        // X-tengely címkék létrehozása (a frekvencia binek)
+        const labels = [];
+        for (let i = 0; i < SAMPLES / 2; i++) {
+            // Címkék Hz-ben (pl. 43, 86, 129, stb.)
+            labels.push((i * FREQUENCY_RESOLUTION).toFixed(0)); 
+        }
+
+
+        // Diagram inicializálása a weboldal betöltődése után
+        window.onload = function() {
+            const ctx = document.getElementById('fftChart').getContext('2d');
+            
+            fftChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'FFT Amplitúdó (Magnitude)',
+                        data: [], // Ezt frissíti a WebSocket
+                        borderColor: 'rgb(75, 192, 192)',
+                        borderWidth: 1,
+                        pointRadius: 0, // Ne jelenjenek meg pontok, csak a vonal
+                    }]
+                },
+                options: {
+                    animation: false, // Fontos: Kikapcsolja az animációt a gyors frissítéshez
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Frekvencia (Hz)'
+                            }
+                        },
+                        y: {
+                            beginAtZero: true
+                        }
+                    },
+                    plugins: {
+                        legend: { display: false }
+                    }
+                }
+            });
+        };
+
+
+        // 2. WebSocket események kezelése
+        
+        // Kapcsolat sikeresen létrejött
+        websocket.onopen = function() {
+            document.getElementById('status').textContent = "CSATLAKOZTATVA";
+            console.log("WebSocket kapcsolat létrejött.");
+        };
+
+        // Kapcsolat hiba
+        websocket.onerror = function(error) {
+            document.getElementById('status').textContent = "HIBA! Ellenőrizze az IP-címet és az ESP32-t.";
+            console.log("WebSocket hiba: ", error);
+        };
+
+        // Kapcsolat bezárult
+        websocket.onclose = function() {
+            document.getElementById('status').textContent = "KAPCSOLAT MEGSZAKADT";
+            console.log("WebSocket kapcsolat megszakadt.");
+        };
+
+        // Adatok fogadása és diagram frissítése
+        websocket.onmessage = function(event) {
+            const rawData = event.data;
+            
+            // 1. A vesszővel elválasztott string tömbbé alakítása
+            // map(Number) biztosítja, hogy a stringekből számok legyenek.
+            const newData = rawData.split(',').map(Number); 
+
+            if (fftChart) {
+                // 2. A diagram adatsorának frissítése az új adatokkal
+                fftChart.data.datasets[0].data = newData;
+                
+                // 3. A diagram újra rajzolása
+                fftChart.update();
+            }
+        };
+
+    </script>
+</body>
+</html>
