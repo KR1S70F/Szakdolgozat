@@ -1,10 +1,9 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ESP32 Valós Idejű FFT Spektrum</title>
+    <title>ESP32 Szűkített FFT Spektrum (0-2500 Hz)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
-        /* Kisebb stílus a diagram központosításához */
         body {
             font-family: sans-serif;
             display: flex;
@@ -13,19 +12,38 @@
             padding-top: 20px;
         }
         #fftChart {
-            max-width: 900px;
+            /* A diagram maximális szélessége */
+            max-width: 1550px; 
             max-height: 500px;
+        }
+        #download-block {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            background-color: #f9f9f9;
         }
     </style>
 </head>
 <body>
 
-    <h1>ESP32 FFT Spektrum (Valós Időben)</h1>
+    <h1>ESP32 FFT Spektrum (0-2500 Hz, kb. 86 Hz-es lépésekben)</h1>
+    
+    <div id="download-block">
+        <h3>Adatletöltés (CSV)</h3>
+        <p>A mentett adatok letöltéséhez kattintson a linkre (az ESP32 Web Server-e szolgálja ki).</p>
+        
+        <a id="downloadLink" href="#" target="_blank">
+            ⬇️ Letöltés: fft_data.csv
+        </a>
+    </div>
     <canvas id="fftChart" width="800" height="400"></canvas>
     <p>Állapot: <span id="status">Kapcsolódás...</span></p>
 
     <script>
-        const ESP32_IP = "172.20.10.6"; // IP címet le kell cserélni arra amit az Arduino kiír!!
+
+        // SAJÁT ESP32 IP-CÍM KELL!
+
+        const ESP32_IP = "172.20.10.6"; // A Serial Monitorban kiírt IP-cím
         const WEBSOCKET_PORT = 81; 
         
         const websocket = new WebSocket(`ws://${ESP32_IP}:${WEBSOCKET_PORT}/`);
@@ -33,19 +51,30 @@
         let fftChart;
         const SAMPLES = 1024;
         const SAMPLING_FREQUENCY = 44100;
-        const FREQUENCY_RESOLUTION = SAMPLING_FREQUENCY / SAMPLES; // ~43.07 Hz
+        const FREQUENCY_RESOLUTION = SAMPLING_FREQUENCY / SAMPLES; 
 
-        // X-tengely címkék létrehozása (a frekvencia binek)
+        // SZŰKÍTETT TARTOMÁNY KONSTANS
+        const MAX_FREQ_DISPLAY = 2500; // Maximális megjelenített frekvencia
+        
+        // Kiszámoljuk, hány FFT bint kell felhasználni az 2500 Hz-hez
+        const MAX_BINS_DISPLAY = Math.ceil(MAX_FREQ_DISPLAY / FREQUENCY_RESOLUTION);
+
+        // X-tengely címkék létrehozása (csak 2500 Hz-ig)
         const labels = [];
-        for (let i = 0; i < SAMPLES / 2; i++) {
-            // Címkék Hz-ben (pl. 43, 86, 129, stb.)
+        for (let i = 0; i < MAX_BINS_DISPLAY; i++) {
             labels.push((i * FREQUENCY_RESOLUTION).toFixed(0)); 
         }
 
 
-        // Diagram inicializálása a weboldal betöltődése után
+        // ----------------------------------------------------
+        // DIAGRAM INICIALIZÁLÁSA (Chart.js)
+        // ----------------------------------------------------
+
         window.onload = function() {
             const ctx = document.getElementById('fftChart').getContext('2d');
+
+            // --- DINAMIKUS LETÖLTÉSI LINK BEÁLLÍTÁSA ---
+            document.getElementById('downloadLink').href = `http://${ESP32_IP}/download`;
             
             fftChart = new Chart(ctx, {
                 type: 'line',
@@ -53,25 +82,36 @@
                     labels: labels,
                     datasets: [{
                         label: 'FFT Amplitúdó (Magnitude)',
-                        data: [], // Ezt frissíti a WebSocket
+                        data: [], 
                         borderColor: 'rgb(75, 192, 192)',
                         borderWidth: 1,
-                        pointRadius: 0, // Ne jelenjenek meg pontok, csak a vonal
+                        pointRadius: 0, 
                     }]
                 },
                 options: {
-                    animation: false, // Fontos: Kikapcsolja az animációt a gyors frissítéshez
+                    animation: false, 
                     responsive: true,
                     maintainAspectRatio: false,
                     scales: {
                         x: {
                             title: {
                                 display: true,
-                                text: 'Frekvencia (Hz)'
+                                text: `Frekvencia (Hz) - Maximum ${MAX_FREQ_DISPLAY} Hz`
+                            },
+                            ticks: {
+                                stepSize: 2, 
+                                autoSkip: false, 
+                                maxRotation: 0 
                             }
                         },
                         y: {
-                            beginAtZero: true
+                            beginAtZero: true,
+                            // Függőleges skála maximuma
+                            max: 2500000000, 
+                            title: {
+                                display: true,
+                                text: 'Amplitúdó (Magnitude)'
+                            }
                         }
                     },
                     plugins: {
@@ -82,39 +122,33 @@
         };
 
 
-        // 2. WebSocket események kezelése
-        
-        // Kapcsolat sikeresen létrejött
+        // ----------------------------------------------------
+        // WEBSOCKET ÉS ADATKEZELÉS
+        // ----------------------------------------------------
+
         websocket.onopen = function() {
             document.getElementById('status').textContent = "CSATLAKOZTATVA";
-            console.log("WebSocket kapcsolat létrejött.");
         };
 
-        // Kapcsolat hiba
         websocket.onerror = function(error) {
             document.getElementById('status').textContent = "HIBA! Ellenőrizze az IP-címet és az ESP32-t.";
             console.log("WebSocket hiba: ", error);
         };
 
-        // Kapcsolat bezárult
         websocket.onclose = function() {
             document.getElementById('status').textContent = "KAPCSOLAT MEGSZAKADT";
-            console.log("WebSocket kapcsolat megszakadt.");
         };
 
         // Adatok fogadása és diagram frissítése
         websocket.onmessage = function(event) {
             const rawData = event.data;
-            
-            // 1. A vesszővel elválasztott string tömbbé alakítása
-            // map(Number) biztosítja, hogy a stringekből számok legyenek.
-            const newData = rawData.split(',').map(Number); 
+            const fullData = rawData.split(',').map(Number); 
+
+            // Szűkítés: Csak a MAX_BINS_DISPLAY mennyiségű adatot használjuk
+            const limitedData = fullData.slice(0, MAX_BINS_DISPLAY);
 
             if (fftChart) {
-                // 2. A diagram adatsorának frissítése az új adatokkal
-                fftChart.data.datasets[0].data = newData;
-                
-                // 3. A diagram újra rajzolása
+                fftChart.data.datasets[0].data = limitedData;
                 fftChart.update();
             }
         };
