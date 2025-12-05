@@ -3,6 +3,8 @@
 #include <WebSocketsServer.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
+#include "FS.h"
+#include "SPIFFS.h"
 
 // 1. WiFi Hitelesítő Adatok
 const char* ssid = "Kristof"; 
@@ -10,11 +12,14 @@ const char* password = "tesztfft";
 
 // 2. I2S/INMP441 Pin Konfiguráció (ESP32 Tűk)
 #define I2S_PORT I2S_NUM_0
-#define I2S_SCK_PIN 33   // Bit Clock
-#define I2S_WS_PIN 25    // Word Select / Left-Right Clock
-#define I2S_SD_PIN 32    // Serial Data In (INMP441 Data Out)
+#define I2S_SCK_PIN 18   // Bit Clock
+#define I2S_WS_PIN 19    // Word Select / Left-Right Clock
+#define I2S_SD_PIN 21    // Serial Data In (INMP441 Data Out)
 #define I2S_SAMPLE_RATE 44100
 #define I2S_BUFFER_SIZE 1024
+
+
+
 
 // ----------------------------------------------------------------------------------
 // --- FFT Konfiguráció ---
@@ -30,10 +35,41 @@ double vImag[SAMPLES]; // Képzetes számok tömbje (mindig 0.0)
 ArduinoFFT FFT = ArduinoFFT(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
 
 // ----------------------------------------------------------------------------------
-// --- WebSocket Konfiguráció ---
+// --- 3. MENTÉSI ÉS WEBSERVER KONFIGURÁCIÓ ---
 // ----------------------------------------------------------------------------------
 
-WebSocketsServer webSocket = WebSocketsServer(81); // 81-es port a WebSocketnek
+// Mentési konfiguráció (SPIFFS)
+const char* FILENAME = "/fft_data.csv"; 
+const int LOG_INTERVAL = 500;           // Mentés minden 500. ciklusonként
+int logCounter = 0;                     
+char logBuffer[20480];                  // 20 KB puffer
+int bufferIndex = 0;
+
+// Szerver és WebSocket objektumok
+WebSocketsServer webSocket = WebSocketsServer(81); 
+WebServer server(80); // HTTP WebServer
+
+// MOZGÓÁTLAG SZŰRŐ MÉRETE (ablakszélesség)
+// Kísérletezéssel állítandó be (pl. 4 és 16 között)
+const int MA_FILTER_SIZE = 8; 
+
+// Puffer a szűrt adatok tárolására, a vReal és vImag után
+double filtered_vReal[SAMPLES];
+
+
+// EXPONENCIÁLIS MOZGÓÁTLAG (EMA) SZŰRŐ KONFIGURÁCIÓ
+
+// Alpha (simító faktor): 0 és 1 közötti érték. 
+// Kisebb ALPHA = ERŐSEBB simítás
+const double ALPHA = 0.1; 
+
+// Állapotváltozó: Az előző szűrt kimenet tárolása. 
+// Ennek globálisnak kell lennie, hogy a loop() hívások között megmaradjon az értéke.
+double ema_previous_output = 0.0;
+
+// ----------------------------------------------------------------------------------
+// --- WebSocket Konfiguráció ---
+// ----------------------------------------------------------------------------------
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   // A kliens események kezelése (itt csak logolás történik)
@@ -48,6 +84,28 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       break;
   }
 }
+void handleRoot() {
+  String html = "<h1>ESP32 FFT Adatmentés</h1>";
+  html += "<p>Kattintson ide a mentett CSV adatok letöltéséhez:</p>";
+  html += "<p><a href='/download'>fft_data.csv letöltése</a></p>";
+  html += "<p>A valós idejű grafikon a WebSocket porton fut (81). Keressen ra a forraskodban megadott IP-cimen.</p>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleDownload() {
+  if (SPIFFS.exists(FILENAME)) {
+    File file = SPIFFS.open(FILENAME, "r");
+    server.streamFile(file, "text/csv");
+    file.close();
+  } else {
+    server.send(404, "text/plain", "404: A mentesi fajl ('fft_data.csv') nem talalhato.");
+  }
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "404: File Not Found");
+}
 
 // ----------------------------------------------------------------------------------
 // --- SETUP ---
@@ -57,7 +115,21 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // 1. WiFi csatlakozás
+  // SPIFFS Inicializálás
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Hiba történt a SPIFFS mountolása közben!");
+    return;
+  }
+  Serial.println("SPIFFS sikeresen inicializálva.");
+
+  // SPIFFS Buffer Fejlécének Előkészítése
+  bufferIndex += sprintf(logBuffer + bufferIndex, "Timestamp,");
+  for (int i = 0; i < SAMPLES / 2; i++) {
+    bufferIndex += sprintf(logBuffer + bufferIndex, "Frekvencia_%d%s", i, (i == SAMPLES / 2 - 1) ? "" : ",");
+  }
+  bufferIndex += sprintf(logBuffer + bufferIndex, "\n");
+
+  // WiFi csatlakozás
   Serial.print("Csatlakozás a WiFi-hez...");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -69,7 +141,7 @@ void setup() {
   Serial.println(WiFi.localIP());
   Serial.println("Kliens csatlakoztatásához nyissa meg az IP-címet a böngészőben, 81-es porton.");
 
-  // 2. I2S Konfiguráció
+  // I2S Konfiguráció
   const i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = I2S_SAMPLE_RATE,
@@ -93,9 +165,15 @@ void setup() {
   i2s_set_pin(I2S_PORT, &pin_config);
   i2s_set_clk(I2S_PORT, (int)SAMPLING_FREQUENCY, I2S_BITS_PER_SAMPLE_24BIT, I2S_CHANNEL_MONO); // Monó módot állítunk be
 
-  // 3. WebSocket indítása
+  // WebSocket indítása
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
+
+  server.on("/", handleRoot);
+  server.on("/download", handleDownload);
+  server.onNotFound(handleNotFound);
+  server.begin(); 
+  Serial.println("Web Server elindult a 80-as porton.");
 }
 
 // ----------------------------------------------------------------------------------
@@ -104,6 +182,7 @@ void setup() {
 
 void loop() {
   webSocket.loop(); // Websocket kliensek kezelése
+  server.handleClient();
 
   // Deklarációk a loop() belsejében
   size_t bytes_read;
@@ -124,10 +203,78 @@ void loop() {
       vImag[i] = 0.0;
     }
 
+   /* 
+    // --------------------------------------------------------------------
+    // 2.5 MOZGÓÁTLAG SZŰRŐ ALKALMAZÁSA (TIME DOMAIN)
+    // --------------------------------------------------------------------
+    for (int i = 0; i < SAMPLES; i++) {
+        double sum = 0.0;
+        int count = 0;
+    
+        // Az ablak visszamenőlegesen gyűjti az adatokat az i-j pontokból
+        for (int j = 0; j < MA_FILTER_SIZE; j++) {
+            int index = i - j;
+        
+            // Csak az érvényes, már beolvasott indexeket használjuk
+            if (index >= 0) {
+                sum += vReal[index];
+                count++;
+            }
+        }
+    
+        // Szűrt átlag beállítása
+        if (count > 0) {
+            filtered_vReal[i] = sum / count;
+        } else {
+            filtered_vReal[i] = vReal[i]; 
+        }
+    }
+
+    // Az eredeti vReal tömb felülírása a szűrt értékekkel
+    for (int i = 0; i < SAMPLES; i++) {
+        vReal[i] = filtered_vReal[i];
+    }
+    
+    */
+    // --------------------------------------------------------------------
+    // 2.5 EXPONENCIÁLIS MOZGÓÁTLAG (EMA) SZŰRŐ ALKALMAZÁSA (TIME DOMAIN)
+    // Formula: Yt = ALPHA * Xt + (1 - ALPHA) * Yt-1
+    // --------------------------------------------------------------------
+    
+    for (int i = 0; i < SAMPLES; i++) {
+        double Xt = vReal[i]; // A jelenlegi nyers bemenet
+        double Yt;           // Az új szűrt kimenet
+
+        if (i == 0) {
+            // A ciklus első mintájánál az előző állapotot a globális változóból vesszük
+            Yt = ALPHA * Xt + (1.0 - ALPHA) * ema_previous_output;
+        } else {
+            // A további mintáknál az előző, már szűrt értéket használjuk a vReal[i-1]-ből
+            Yt = ALPHA * Xt + (1.0 - ALPHA) * vReal[i - 1]; 
+        }
+        
+        // Az eredeti mintát felülírjuk a szűrt értékkel (inplace filtering)
+        vReal[i] = Yt;
+    }
+    
+    // Frissítjük a globális állapotot a következő loop() híváshoz
+    // (a jelenlegi adathalmaz utolsó szűrt mintáját mentjük el)
+    ema_previous_output = vReal[SAMPLES - 1]; 
+    
+
     // 3. FFT SZÁMÍTÁS
     FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD); // Hamming ablak (spektrális szivárgás csökkentése)
     FFT.compute(FFT_FORWARD);
     FFT.complexToMagnitude(); // Komplex számokból Amplitúdó (Magnitude)
+
+    const int NOISE_THRESHOLD = 1000000; //
+
+   for (int i = 0; i < SAMPLES / 2; i++) { 
+        if (vReal[i] < NOISE_THRESHOLD) {
+          vReal[i] = 0.0; // Ha a zajszint alatt van, lenullázzuk
+      }
+    }
+    
     
     // 4. ADATOK ELKÜLDÉSE WEBSOCKETEN KERESZTÜL
     String fftData = "";
@@ -143,5 +290,37 @@ void loop() {
     
     // Küldés minden csatlakozott kliensnek (TXT formátumban)
     webSocket.broadcastTXT(fftData);
+
+    // 5. ADATMENTÉS ÉS PUFFERELÉS (SPIFFS)
+    logCounter++;
+    if (logCounter >= LOG_INTERVAL) {
+      
+      // Adatok beírása a pufferbe
+      bufferIndex += sprintf(logBuffer + bufferIndex, "%lu,", millis());
+      
+      for (int i = 0; i < SAMPLES / 2; i++) {
+        int magnitude = (int)vReal[i]; 
+        bufferIndex += sprintf(logBuffer + bufferIndex, "%d%s", magnitude, (i == SAMPLES / 2 - 1) ? "" : ",");
+      }
+      bufferIndex += sprintf(logBuffer + bufferIndex, "\n"); 
+      
+      logCounter = 0; 
+      
+      // ELLENŐRZÉS: Ha a puffer majdnem tele van, kiírjuk a fájlba.
+      if (bufferIndex > sizeof(logBuffer) - 1024) { 
+        File file = SPIFFS.open(FILENAME, FILE_APPEND);
+        if (file) {
+            file.write((uint8_t*)logBuffer, bufferIndex); 
+            file.close();
+            Serial.printf("SPIFFS-re írva: %d bájt mentve.\n", bufferIndex);
+        } else {
+            Serial.println("Hiba a mentési fájlba íráskor!");
+        }
+        
+        bufferIndex = 0; // Puffer resetelése
+      }
+    }
   }
+  yield();
+  
 }
